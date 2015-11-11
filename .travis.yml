@@ -1,0 +1,14 @@
+language: csharp
+
+sudo: false
+
+install:
+  - chmod 755 ./build.sh
+
+script: 
+  - ./build.sh AllCore
+
+branches:
+  except:
+    - gh-pages
+    - release

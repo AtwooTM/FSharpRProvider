@@ -1,7 +1,7 @@
 ﻿(*** hide ***)
 // Include the right directories so that the documentation tool tips work
 #nowarn "211" // Ignore warning that a search path does not exist on #I
-#I "../../packages/FSharp.Data.1.1.10/lib/net40/"
+#I "../../packages/FSharp.Data.2.0.7/lib/net40/"
 #I "../../bin/"
 
 (** 
@@ -24,16 +24,12 @@ Assuming you installed the R Type Provider in your project from NuGet,
 you can reference the required libraries and packages this way:
 *)
 
-#I "../packages/RProvider.1.0.3/lib"
-#r "RDotNet.dll"
-#r "RDotNet.FSharp.dll"
-#r "RDotNet.NativeLibrary.dll"
-#r "RProvider.dll"
+#I "../packages/RProvider.1.0.11"
+#load "RProvider.fsx"
 
 open System
 open RDotNet
 open RProvider
-open RProvider.``base``
 open RProvider.graphics
 open RProvider.stats
 

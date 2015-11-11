@@ -1,10 +1,20 @@
-﻿module Test.RProvider
+﻿#if INTERACTIVE
+#I "../../bin"
+#I "../../packages/xunit/lib/net20/"
+#r "RDotNet.dll"
+#r "RProvider.dll"
+#r "RProvider.Runtime.dll"
+#r "../../packages/FsCheck/lib/net40-Client/FsCheck.dll"
+#r "../../packages/FsCheck.Xunit/lib/net40-Client/FsCheck.Xunit.dll"
+#r "xunit.dll"
+#else
+module Test.RProvider
+#endif
 
 open RDotNet
 open RDotNet.Internals
 open RProvider
 open RProvider.RInterop
-open RProvider.``base``
 open System
 open Xunit
 open FsCheck
@@ -87,6 +97,21 @@ let ``Complex scalar round-trip tests`` (r: double) (i: double) =
     if not(Double.IsNaN(r) || Double.IsNaN(i)) then
         let x = Complex(r, i) 
         testScalar x SymbolicExpressionType.ComplexVector None
+
+[<Fact>]
+let ``Printing of data frame returns string with frame data`` () =
+  let df = namedParams [ "Test", box [| 1; 42; 2 |] ] |> R.data_frame
+  Assert.Contains("42", df.Print())
+
+[<Property>]
+let ``Serialization of R values works`` (isValue:bool) (args:string[]) (hasVar:bool) =
+  let args = List.ofSeq args
+  if args |> Seq.forall (fun a -> a <> null && not(a.Contains(";"))) then
+    let rvalue = 
+      if isValue then RValue.Value 
+      else RValue.Function(args, hasVar)
+    let actual = deserializeRValue(serializeRValue(rvalue))
+    Assert.Equal(rvalue, actual)
 
 //[<Property>]
 // Has various issues - embedded nulls, etc.

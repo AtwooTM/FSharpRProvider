@@ -2,6 +2,7 @@
 // FAKE build script 
 // --------------------------------------------------------------------------------------
 
+#I "packages/FAKE/tools"
 #r "packages/FAKE/tools/FakeLib.dll"
 open System
 open Fake 
@@ -26,7 +27,6 @@ let tags = "F# fsharp R TypeProvider visualization statistics"
 
 let gitHome = "https://github.com/BlueMountainCapital"
 let gitName = "FSharpRProvider"
-let testAssemblies = []
 
 // --------------------------------------------------------------------------------------
 // The rest of the code is standard F# build script 
@@ -34,18 +34,20 @@ let testAssemblies = []
 
 // Read release notes & version info from RELEASE_NOTES.md
 Environment.CurrentDirectory <- __SOURCE_DIRECTORY__
+let binDir = __SOURCE_DIRECTORY__ @@ "bin"
 let release = IO.File.ReadLines "RELEASE_NOTES.md" |> parseReleaseNotes
 
 // Generate assembly info files with the right version & up-to-date information
 Target "AssemblyInfo" (fun _ ->
   let fileName = "src/Common/AssemblyInfo.fs"
-  CreateFSharpAssemblyInfo fileName
+  CreateFSharpAssemblyInfoWithConfig fileName
       [ Attribute.Title projectName
         Attribute.Company companyName
         Attribute.Product projectName
         Attribute.Description projectSummary
         Attribute.Version release.AssemblyVersion
         Attribute.FileVersion release.AssemblyVersion ] 
+      (AssemblyInfoFileConfig(false))
 )
 
 // --------------------------------------------------------------------------------------
@@ -65,13 +67,9 @@ Target "UpdateFsxVersions" (fun _ ->
 // --------------------------------------------------------------------------------------
 // Clean build results & restore NuGet packages
 
-Target "RestorePackages" (fun _ ->
-    !! "./**/packages.config"
-    |> Seq.iter (RestorePackage (fun p -> { p with ToolPath = "./.nuget/NuGet.exe" }))
-)
-
 Target "Clean" (fun _ ->
     CleanDirs ["bin"; "temp" ]
+    CleanDirs ["tests/Test.RProvider/bin"; "tests/Test.RProvider/obj" ]
 )
 
 Target "CleanDocs" (fun _ ->
@@ -82,49 +80,75 @@ Target "CleanDocs" (fun _ ->
 // Build library & test project
 
 Target "Build" (fun _ ->
-    { BaseDirectories = [__SOURCE_DIRECTORY__]
-      Includes = ["RProvider.sln"; "RProvider.Tests.sln"]
-      Excludes = [] } 
-    |> Scan
+    !! (projectName + ".sln")
     |> MSBuildRelease "" "Rebuild"
     |> Log "AppBuild-Output: "
 )
 
+Target "BuildTests" (fun _ ->
+    !! (projectName + ".Tests.sln")
+    |> MSBuildRelease "" "Rebuild"
+    |> Log "AppBuild-Output: "
+)
+
+Target "MergeRProviderServer" (fun _ -> 
+  () (*
+    let buildMergedDir = binDir @@ "merged"
+    CreateDir buildMergedDir
+
+    let toPack = 
+        (binDir @@ "RProvider.Server.exe") + " " +
+        (binDir @@ "../tools/FSharp.Core.dll") + " " +
+        (binDir @@ "RDotNet.FSharp.dll") + " " +
+        (binDir @@ "RProvider.Runtime.dll")
+
+    let result = 
+        ExecProcess (fun info -> 
+            info.FileName <- currentDirectory @@ "packages/ILRepack/tools/ILRepack.exe" 
+            info.Arguments <- 
+              sprintf 
+                "/internalize /verbose /lib:bin /ver:%s /out:%s %s" 
+                release.AssemblyVersion (buildMergedDir @@ "RProvider.Server.exe") toPack 
+            ) (TimeSpan.FromMinutes 5.) 
+
+    if result <> 0 then failwithf "Error during ILRepack execution." 
+
+    !! (buildMergedDir @@ "*.*") 
+    |> CopyFiles binDir
+    DeleteDir buildMergedDir
+*)
+) 
+
 // --------------------------------------------------------------------------------------
 // Run the unit tests using test runner & kill test runner when complete
-//
-// TODO: The tests are using xUnit, so tests are not run as part of FAKE currently :-(
-//
-(*
+
 
 Target "RunTests" (fun _ ->
-    let nunitVersion = GetPackageVersion "packages" "NUnit.Runners"
-    let nunitPath = sprintf "packages/NUnit.Runners.%s/Tools" nunitVersion
+    let xunitPath = "packages/xunit.runners/tools/xunit.console.clr4.exe"
 
     ActivateFinalTarget "CloseTestRunner"
 
-    (files ["tests/*/bin/Release/Test.RProvider.dll"])
-    |> NUnit (fun p ->
-        { p with
-            ToolPath = nunitPath
-            DisableShadowCopy = true
-            TimeOut = TimeSpan.FromMinutes 20.
-            OutputFile = "TestResults.xml" })
+    !! "tests/Test.RProvider/bin/**/Test*.dll"
+    |> xUnit (fun p -> 
+            {p with 
+                ToolPath = xunitPath
+                ShadowCopy = false
+                HtmlOutput = true
+                XmlOutput = true
+                OutputDir = "." })
 )
-
+ 
 FinalTarget "CloseTestRunner" (fun _ ->  
-    ProcessHelper.killProcess "nunit-agent.exe"
+    ProcessHelper.killProcess "xunit.console.clr4.exe"
 )
-*)
-Target "RunTests" DoNothing
 
 // --------------------------------------------------------------------------------------
 // Build a NuGet package
 
 Target "NuGet" (fun _ ->
     // Format the description to fit on a single line (remove \r\n and double-spaces)
+    let specificVersion (name, version) = name, sprintf "[%s]" version
     let projectDescription = projectDescription.Replace("\r", "").Replace("\n", "").Replace("  ", " ")
-    let nugetPath = ".nuget/nuget.exe"
     NuGet (fun p -> 
         { p with   
             Authors = authors
@@ -135,7 +159,11 @@ Target "NuGet" (fun _ ->
             ReleaseNotes = String.concat " " release.Notes
             Tags = tags
             OutputPath = "bin"
-            ToolPath = nugetPath
+            Dependencies = 
+              [ "R.NET.Community", GetPackageVersion "packages" "R.NET.Community"
+                "DynamicInterop", GetPackageVersion "packages" "DynamicInterop"
+                "R.NET.Community.FSharp", GetPackageVersion "packages" "R.NET.Community.FSharp" ]
+              |> List.map specificVersion
             AccessKey = getBuildParamOrDefault "nugetkey" ""
             Publish = hasBuildParam "nugetkey" })
         "nuget/RProvider.nuspec"
@@ -170,27 +198,48 @@ Target "ReleaseBinaries" (fun _ ->
     Branches.push "temp/release"
 )
 
+Target "TagRelease" (fun _ ->
+    // Concatenate notes & create a tag in the local repository
+    let notes = (String.concat " " release.Notes).Replace("\n", ";").Replace("\r", "")
+    let tagName = "v" + release.NugetVersion
+    let cmd = sprintf """tag -a %s -m "%s" """ tagName notes
+    CommandHelper.runSimpleGitCommand "." cmd |> printfn "%s"
+
+    // Find the main remote (BlueMountain GitHub)
+    let _, remotes, _ = CommandHelper.runGitCommand "." "remote -v"
+    let main = remotes |> Seq.find (fun s -> s.Contains("(push)") && s.Contains("BlueMountainCapital/FSharpRProvider"))
+    let remoteName = main.Split('\t').[0]
+    Fake.Git.Branches.pushTag "." remoteName tagName
+)
+
 Target "Release" DoNothing
 
 // --------------------------------------------------------------------------------------
 // Run all targets by default. Invoke 'build <Target>' to override
 
 Target "All" DoNothing
+Target "AllCore" DoNothing
 
 "Clean"
-  ==> "RestorePackages"
   ==> "UpdateFsxVersions"
   ==> "AssemblyInfo"
   ==> "Build"
+  ==> "MergeRProviderServer"
+  ==> "BuildTests"
   ==> "RunTests"
   ==> "All"
 
+"MergeRProviderServer"
+  ==> "AllCore"
+
 "All" 
-  ==> "CleanDocs"
-  ==> "GenerateDocs"
-  ==> "ReleaseDocs"
-  ==> "ReleaseBinaries"
-  ==> "NuGet"
+  ==> "CleanDocs" 
+  ==> "GenerateDocs" 
+  ==> "ReleaseDocs" 
+  ==> "ReleaseBinaries" 
   ==> "Release"
+  
+"All" ==> "NuGet" ==> "Release"
+"All" ==> "TagRelease" ==> "Release"
 
 RunTargetOrDefault "All"

@@ -1,25 +1,25 @@
-﻿namespace RProviderConverters
+﻿namespace RProvider.Internal.Converters
 
 open RDotNet
 open RProvider
-open RInteropInternal
+open RInterop
 open System.ComponentModel.Composition
 open System.Linq
 
-// Contains higher-level converters
-
+/// Contains higher-level converters
+/// [omit]
 module Factor = 
     let getLevels sexp = 
         let rvalStr = RInterop.serializeRValue (RValue.Function(["x"], false))
         let symexpr = RInterop.call "base" "levels" rvalStr [| sexp |] [| |]
         symexpr.AsCharacter().ToArray()
 
-    let tryConvert sexp = 
-        match sexp with
-        | IntegerVector(nv) when sexp.Class = [| "factor" |] ->                
+    let tryConvert (sexp:SymbolicExpression) = 
+        match sexp, sexp.Type, sexp.Class with
+        | UntypedVector(nv), Internals.SymbolicExpressionType.IntegerVector, [| "factor" |] ->                
                 Some( let levels = getLevels sexp
-                      nv |> Seq.map (fun i -> levels.[i-1]) 
-                         |> Seq.toArray )
+                      nv.AsInteger() |> Seq.map (fun i -> levels.[i-1]) 
+                                     |> Seq.toArray )
         | _ -> None 
 
     [<Export(typeof<IConvertFromR<string[]>>)>]

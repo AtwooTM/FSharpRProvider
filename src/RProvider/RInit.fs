@@ -1,50 +1,79 @@
-﻿module internal RProvider.RInit
+﻿/// [omit]
+module RProvider.Internal.RInit
 
 open System
 open System.IO
 open Microsoft.Win32
 open RDotNet
-
-/// When set to 'true' before the R engine is initialized, the initialization
-/// will set the 'R_CStackLimit' variable to -1 (which disables stack checking
-/// in the R engine and makes it possible to call R engine from multiple threads
-///
-/// This should not generally be done, but it is hard to avoid in a type provider
-/// called by the F# compiler and engine called by user code.
-///
-/// When this is *not* done, the R provider will occasionally report 
-/// "Error: C stack usage is too close to the limit" when it is called from 
-/// another thread (not concurrently, just from another thread than previously).
-///
-/// For more information, see somewhat vague comment "8.1.5 Threading issues" 
-/// in: www.cran.r-project.org/doc/manuals/R-exts.pdf
-///
-/// NOTE: For this to work correctly, the R engine must be initialized lazily
-/// *after* this variable is set in the static constructor of the RProvider
-let mutable DisableStackChecking = false
+open RProvider
 
 /// Represents R value used in initialization or information about failure
-type internal RInitResult<'T> =
+type RInitResult<'T> =
   | RInitResult of 'T
   | RInitError of string
+
+let internal isUnixOrMac () = 
+    let platform = Environment.OSVersion.Platform 
+    // The guide at www.mono-project.com/FAQ:_Technical says to also check for the
+    // value 128, but that is only relevant to old versions of Mono without F# support
+    platform = PlatformID.MacOSX || platform = PlatformID.Unix              
 
 /// Find the R installation. First check "R_HOME" environment variable, then look 
 /// at the SOFTWARE\R-core\R\InstallPath value (using HKCU or, as a second try HKLM root)
 let private getRLocation () =
-    let getRLocationFromRCoreKey (rCore:RegistryKey) =
-        let key = rCore.OpenSubKey "R"
-        if key = null then RInitError "SOFTWARE\R-core exists but subkey R does not exist"
-        else key.GetValue "InstallPath" |> unbox<string> |> RInitResult
+    let rec getRLocationFromRCoreKey (rCore:RegistryKey) =
+        /// Iterates over all subkeys in "SOFTWARE\R-core". If a key with name "R"
+        /// exists, then it is returned first (because that's the one where the 
+        /// InstallPath should be according to the documentation).
+        let keys (rCore:RegistryKey) =
+            let rec loop (root:RegistryKey) = seq { 
+                yield root
+                for subKeyName in root.GetSubKeyNames() do
+                    yield! loop <| root.OpenSubKey(subKeyName) }
+            seq { let key = rCore.OpenSubKey "R" 
+                  if key <> null then yield key
+                  yield! loop rCore }
+
+        let hasInstallPath (key:RegistryKey) =
+            key.GetValueNames()
+            |> Array.exists (fun valueName -> valueName = "InstallPath")
+
+        match rCore |> keys |> Seq.tryFind (fun key -> key |> hasInstallPath) with
+        | Some(key) -> key.GetValue("InstallPath") |> unbox<string> |> RInitResult
+        | None      -> RInitError "R was not found (SOFTWARE\R-core exists but subkey R does not)"
 
     let locateRfromRegistry () =
+        Logging.logf "Scanning the registry"
         match Registry.LocalMachine.OpenSubKey @"SOFTWARE\R-core", Registry.CurrentUser.OpenSubKey @"SOFTWARE\R-core" with
-        | null, null -> RInitError "Reg key Software\R-core does not exist; R is likely not installed on this computer"
+        | null, null -> RInitError "R is not installed (Software\R-core does not exist)"
         | null, x 
         | x, _ -> getRLocationFromRCoreKey x
 
+    let locateRfromShellR () = 
+        Logging.logf "Calling 'R --print-home'"
+        try
+            // Run the process & read standard output
+            let ps = System.Diagnostics.ProcessStartInfo
+                      ( FileName = "R", Arguments = "--print-home",
+                        RedirectStandardOutput = true, UseShellExecute = false)
+            let p = System.Diagnostics.Process.Start(ps)
+            p.WaitForExit()
+            let path = p.StandardOutput.ReadToEnd()
+            Logging.logf "R --print-home returned: %s" path
+            RInitResult(path.Trim())
+        with e -> 
+            Logging.logf "Calling 'R --print-home' failed with: %A" e
+            RInitError("R is not installed (running 'R --print-home' failed")
+
+    // First, check R_HOME. If that's not set, then on Mac or Unix, we use 
+    // `R --print-home` and on Windows, we look at "SOFTWARE\R-core" in registry
     Logging.logf "getRLocation"
+
+    // On Mac and Unix we run "R --print-home" hoping that R is in PATH
     match Environment.GetEnvironmentVariable "R_HOME" with
-    | null -> locateRfromRegistry()
+    | null -> 
+        if isUnixOrMac() then locateRfromShellR()
+        else locateRfromRegistry()
     | rPath -> RInitResult rPath 
 
 /// Find the R installation using 'getRLocation' and add the directory to the
@@ -55,23 +84,20 @@ let private setupPathVariable () =
       match getRLocation() with
       | RInitError error -> RInitError error
       | RInitResult location ->
-          let isLinux = 
-              let platform = Environment.OSVersion.Platform 
-              // The guide at www.mono-project.com/FAQ:_Technical says to also check for the
-              // value 128, but that is only relevant to old versions of Mono without F# support
-              platform = PlatformID.MacOSX || platform = PlatformID.Unix              
           let binPath = 
-              if isLinux then 
+              if isUnixOrMac() then 
                   Path.Combine(location, "lib") 
               else
                   Path.Combine(location, "bin", if Environment.Is64BitProcess then "x64" else "i386")
+
           // Set the path
-          if not ((Path.Combine(binPath, "libR.so") |> File.Exists) || (Path.Combine(binPath,"R.dll") |> File.Exists)) then
+          if not ((Path.Combine(binPath, "libR.dylib") |> File.Exists) ||
+                  (Path.Combine(binPath, "libR.so") |> File.Exists) || 
+                  (Path.Combine(binPath, "R.dll") |> File.Exists)) then
               RInitError (sprintf "No R engine at %s" binPath)
           else
-              // Set the path
-              let pathSepChar = if isLinux then ":" else ";"
-              Environment.SetEnvironmentVariable("PATH", Environment.GetEnvironmentVariable("PATH") + pathSepChar + binPath)
+              Logging.logf "setupPathVariable: path='%s', home='%s'" binPath location
+              REngine.SetEnvironmentVariables(binPath, location)
               Logging.logf "setupPathVariable completed"
               RInitResult ()
     with e ->
@@ -79,28 +105,18 @@ let private setupPathVariable () =
       reraise()
 
 /// Global interceptor that captures R console output
-let characterDevice = new CharacterDeviceInterceptor()
+let internal characterDevice = new CharacterDeviceInterceptor()
 
 /// Lazily initialized value that, when evaluated, sets the PATH variable
 /// to include the R location, or fails and returns RInitError
-let initResult = Lazy<_>.Create(fun () -> setupPathVariable())
+let initResult = Lazy<_>(fun () -> setupPathVariable())
 
-/// Lazily initialized R engine. When 'DisableStackChecking' has been set prior
-/// to the initialization (in the static constructor of RProvider), then 
-/// set the 'R_CStackLimit' variable to -1.
-let engine = Lazy<_>.Create(fun () ->
+/// Lazily initialized R engine.
+let internal engine = Lazy<_>(fun () ->
     try
-        Logging.logf "engine: Creating instance" 
+        Logging.logf "engine: Creating and initializing instance (sizeof<IntPtr>=%d)" IntPtr.Size 
         initResult.Force() |> ignore
-        let engine = REngine.CreateInstance(System.AppDomain.CurrentDomain.Id.ToString())
-        Logging.logf "engine: Intializing instance"
-        engine.Initialize(null, characterDevice)
-            
-        if DisableStackChecking then
-            // This needs to be called *after* the initialization of REngine
-            let varAddress = engine.DangerousGetHandle("R_CStackLimit")
-            System.Runtime.InteropServices.Marshal.WriteInt32(varAddress, -1)
-    
+        let engine = REngine.GetInstance(null, true, null, characterDevice)
         System.AppDomain.CurrentDomain.DomainUnload.Add(fun _ -> engine.Dispose()) 
         Logging.logf "engine: Created & initialized instance"
         engine

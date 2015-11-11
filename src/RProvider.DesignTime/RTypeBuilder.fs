@@ -6,54 +6,46 @@ open System.Reflection
 open System.IO
 open System.Diagnostics
 open System.Threading
-open Samples.FSharp.ProvidedTypes
+open ProviderImplementation.ProvidedTypes
 open Microsoft.FSharp.Core.CompilerServices
-open RDotNet
-open RInteropInternal
+open RProvider
+open RProvider.Internal
 open RInterop
+open RInteropInternal
+open RInteropClient
 open Microsoft.Win32
 open System.IO
 
-[<TypeProvider>]
-type public RProvider(cfg:TypeProviderConfig) as this =
-    inherit TypeProviderForNamespaces()
-
-    // Set the R 'R_CStackLimit' variable to -1 when initializing the R engine
-    // (the engine is initialized lazily, so the initialization always happens
-    // after the static constructor is called - by doing this in the static constructor
-    // we make sure that this is *not* set in the normal execution)
-    static do RInit.DisableStackChecking <- true
-
+module internal RTypeBuilder =
+    
     /// Assuming initialization worked correctly, generate the types using R engine
-    let generateTypes ns asm =
-        // Expose all available packages as namespaces
+    let generateTypes ns asm = withServer <| fun server ->
+      [ // Expose all available packages as namespaces
         Logging.logf "generateTypes: getting packages"
-        for package in getPackages() do
-            let pns = ns + "." + package
+        let packages = 
+          [ yield "base", ns
+            for package in server.GetPackages() do yield package, ns + "." + package ]
+        for package, pns in packages do
             let pty = ProvidedTypeDefinition(asm, pns, "R", Some(typeof<obj>))    
 
-            pty.AddXmlDocDelayed <| fun () -> getPackageDescription package
+            pty.AddXmlDocDelayed <| fun () -> withServer <| fun serverDelayed -> serverDelayed.GetPackageDescription package
             pty.AddMembersDelayed( fun () -> 
-              [ loadPackage package
-                let bindings = getBindings package
+              withServer <| fun serverDelayed ->
+              [ serverDelayed.LoadPackage package
+                let bindings = serverDelayed.GetBindings package
 
                 // We get the function descriptions for R the first time they are needed
-                let titles = lazy getFunctionDescriptions package
+                let titles = lazy Map.ofSeq (withServer (fun s -> s.GetFunctionDescriptions package))
 
-                for name, rval in Map.toSeq bindings do
+                for name, serializedRVal in bindings do
                     let memberName = makeSafeName name
-
-                    // Serialize RValue to a string, so that we can include it in the 
-                    // compiled quotation (and do not have to get the info again at runtime)
-                    let serializedRVal = RInterop.serializeRValue rval
-
-                    match rval with
+                    match RInterop.deserializeRValue serializedRVal with
                     | RValue.Function(paramList, hasVarArgs) ->
                         let paramList = [ for p in paramList -> 
                                                 ProvidedParameter(makeSafeName p,  typeof<obj>, optionalValue=null)
 
                                           if hasVarArgs then
-                                            yield ProvidedParameter("paramArray", typeof<obj[]>, optionalValue=null, isParamArray=true)
+                                            yield ProvidedParameter("paramArray", typeof<obj[]>, optionalValue=null, IsParamArray=true)
                                         ]
                         
                         let paramCount = paramList.Length
@@ -61,7 +53,7 @@ type public RProvider(cfg:TypeProviderConfig) as this =
                         let pm = ProvidedMethod(
                                       methodName = memberName,
                                       parameters = paramList,
-                                      returnType = typeof<SymbolicExpression>,
+                                      returnType = typeof<RDotNet.SymbolicExpression>,
                                       IsStaticMethod = true,
                                       InvokeCode = fun args -> if args.Length <> paramCount then
                                                                  failwithf "Expected %d arguments and received %d" paramCount args.Length
@@ -87,7 +79,7 @@ type public RProvider(cfg:TypeProviderConfig) as this =
                         let pdm = ProvidedMethod(
                                       methodName = memberName,
                                       parameters = [ ProvidedParameter("paramsByName",  typeof<IDictionary<string,obj>>) ],
-                                      returnType = typeof<SymbolicExpression>,
+                                      returnType = typeof<RDotNet.SymbolicExpression>,
                                       IsStaticMethod = true,
                                       InvokeCode = fun args -> if args.Length <> 1 then
                                                                  failwithf "Expected 1 argument and received %d" args.Length
@@ -99,41 +91,29 @@ type public RProvider(cfg:TypeProviderConfig) as this =
                     | RValue.Value ->
                         yield ProvidedProperty(
                                 propertyName = memberName,
-                                propertyType = typeof<SymbolicExpression>,
+                                propertyType = typeof<RDotNet.SymbolicExpression>,
                                 IsStatic = true,
                                 GetterCode = fun _ -> <@@ RInterop.call package name serializedRVal [| |] [| |] @@>) :> MemberInfo  ] )
                       
-            this.AddNamespace(pns, [ pty ])
+            yield pns, [ pty ] ]
     
     /// Check if R is installed - if no, generate type with properties displaying
     /// the error message, otherwise go ahead and use 'generateTypes'!
-    let initAndGenerate () =
+    let initAndGenerate providerAssembly = 
+       [  // Get the assembly and namespace used to house the provided types
+          Logging.logf "initAndGenerate: starting"
+          let ns = "RProvider"
 
-        // Get the assembly and namespace used to house the provided types
-        Logging.logf "initAndGenerate: starting"
-        let asm = System.Reflection.Assembly.GetExecutingAssembly()
-        let ns = "RProvider"
-
-        match RInit.initResult.Value with
-        | RInit.RInitError error ->
-            // add an error static property (shown when typing `R.`)
-            let pty = ProvidedTypeDefinition(asm, ns, "R", Some(typeof<obj>))
-            let prop = ProvidedProperty("<Error>", typeof<string>, IsStatic = true, GetterCode = fun _ -> <@@ error @@>)
-            prop.AddXmlDoc error
-            pty.AddMember prop
-            this.AddNamespace(ns, [ pty ])
-            // add an error namespace (shown when typing `open RProvider.`)
-            this.AddNamespace(ns + ".Error: " + error, [ pty ])
-        | _ -> 
-            generateTypes ns asm        
-        Logging.logf "initAndGenerate: finished"
-
-
-    // Generate all the types and log potential errors
-    do  try initAndGenerate() 
-        with e ->
-          Logging.logf "RProvider constructor failed: %O" e
-          reraise()
-
-[<TypeProviderAssembly>]
-do()
+          match tryGetInitializationError() with
+          | null -> 
+              yield! generateTypes ns providerAssembly
+          | error ->
+              // add an error static property (shown when typing `R.`)
+              let pty = ProvidedTypeDefinition(providerAssembly, ns, "R", Some(typeof<obj>))
+              let prop = ProvidedProperty("<Error>", typeof<string>, IsStatic = true, GetterCode = fun _ -> <@@ error @@>)
+              prop.AddXmlDoc error
+              pty.AddMember prop
+              yield ns, [ pty ]
+              // add an error namespace (shown when typing `open RProvider.`)
+              yield ns + ".Error: " + error, [ pty ]
+          Logging.logf "initAndGenerate: finished" ]

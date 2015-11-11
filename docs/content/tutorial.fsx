@@ -1,7 +1,7 @@
 ﻿(*** hide ***)
 // Include the right directories so that the documentation tool tips work
 #nowarn "211" // Ignore warning that a search path does not exist on #I
-#I "../../packages/FSharp.Data.1.1.10/lib/net40/"
+#I "../../packages/FSharp.Data/lib/net40/"
 #I "../../bin/"
 
 (** 
@@ -18,10 +18,10 @@ we use `open` to reference a number of packages including `stats`, `tseries` and
 #r "RDotNet.FSharp.dll"
 #r "RDotNet.NativeLibrary.dll"
 #r "RProvider.dll"
+#r "RProvider.Runtime.dll"
  
 open RDotNet
 open RProvider
-open RProvider.``base``
 open RProvider.graphics
 open RProvider.stats
 open RProvider.tseries
@@ -29,7 +29,6 @@ open RProvider.zoo
 
 open System
 open System.Net
-
 (**
 If either of the namespaces above are unrecognized, you need to install the package in R
 using `install.packages("stats")`.
@@ -53,7 +52,7 @@ type Stocks = CsvProvider<"http://ichart.finance.yahoo.com/table.csv?s=SPX">
 /// of days (starting from the most recent)
 let getStockPrices stock count =
   let url = "http://ichart.finance.yahoo.com/table.csv?s="
-  [| for r in Stocks.Load(url + stock).Take(count).Data -> float r.Open |] 
+  [| for r in Stocks.Load(url + stock).Take(count).Rows -> float r.Open |] 
   |> Array.rev
 
 /// Get opening prices for MSFT for the last 255 days
